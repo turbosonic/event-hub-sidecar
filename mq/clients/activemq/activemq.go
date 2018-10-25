@@ -3,13 +3,18 @@ package activemq
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"time"
 
 	MQTT "github.com/eclipse/paho.mqtt.golang"
 	"pack.ag/amqp"
+
+	"event-delivery-sidecar/dto"
+	"event-delivery-sidecar/mq"
 )
 
 type MQClient struct {
@@ -17,16 +22,11 @@ type MQClient struct {
 	AMQPclient  *amqp.Client
 	AMQPsession *amqp.Session
 	MQTTclient  MQTT.Client
-	// ************
-	// --> START HERE senders     map[string]*amqp.Sender
+	sender      *amqp.Sender
 }
 
-func (mqc MQClient) Listen(c chan []byte) {
-	queueName := os.Getenv("INGRESS_QUEUE_NAME")
-
-	if queueName == "" {
-		queueName = "event-hub"
-	}
+func (mqc MQClient) Listen(handleEvent mq.EventFunction) {
+	queueName := os.Getenv("MICROSERVICE_NAME")
 
 	// Create a receiver
 	receiver, err := mqc.AMQPsession.NewReceiver(
@@ -36,60 +36,63 @@ func (mqc MQClient) Listen(c chan []byte) {
 	if err != nil {
 		log.Fatal("Creating receiver link:", err)
 	}
-	defer func() {
-		ctx, cancel := context.WithTimeout(mqc.ctx, 1*time.Second)
-		receiver.Close(ctx)
-		cancel()
+
+	go func() {
+		for {
+			// Receive next message
+			msg, err := receiver.Receive(context.Background())
+			if err != nil {
+				log.Print("Reading message from AMQP:", err)
+				connect(&mqc)
+				break
+			}
+
+			var e = dto.Event{}
+			if err := json.Unmarshal(msg.GetData(), &e); err != nil {
+				fmt.Printf("Could not unmarshal event: ", err)
+				msg.Release()
+			}
+
+			response := handleEvent(e)
+			switch response {
+			case dto.Accepted:
+				msg.Accept()
+			case dto.Rejected:
+				msg.Release()
+			default:
+				msg.Release()
+			}
+
+		}
 	}()
 
-	for {
-		// Receive next message
-		msg, err := receiver.Receive(mqc.ctx)
-		if err != nil {
-			log.Print("Reading message from AMQP:", err)
-			connect(&mqc)
-			break
+	mqc.MQTTclient.Subscribe(os.Getenv("MICROSERVICE_NAME"), byte(0), func(client MQTT.Client, m MQTT.Message) {
+		var e = dto.Event{}
+		if err := json.Unmarshal(m.Payload(), &e); err != nil {
+			fmt.Printf("Could not unmarshal event: ", err)
 		}
 
-		c <- msg.GetData()
-
-		msg.Accept()
-	}
+		handleEvent(e)
+	})
 }
 
-func (mqc MQClient) SendToQueue(queueName string, event *[]byte) error {
-
-	// Create a sender
-	_, found := mqc.senders[queueName]
-	if found == false {
-		newsender, err := mqc.AMQPsession.NewSender(
-			amqp.LinkTargetAddress("/" + queueName),
-		)
-		if err != nil {
-			log.Println("Creating sender link:", err)
-			return err
-		}
-		mqc.senders[queueName] = newsender
-	}
-
-	sender := mqc.senders[queueName]
-
+func (mqc MQClient) Send(event *dto.Event) error {
 	// Send message
-	err := sender.Send(mqc.ctx, amqp.NewMessage(*event))
+	eventBytes, err := event.ToByteArray()
 	if err != nil {
-		log.Println("Sending message:", err)
+		return err
 	}
-	return err
-}
 
-func (mqc MQClient) SendToTopic(topicName string, event *[]byte) error {
-	tk := mqc.MQTTclient.Publish(topicName, byte(0), false, *event)
-	return tk.Error()
+	err = mqc.sender.Send(mqc.ctx, amqp.NewMessage(eventBytes))
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func New() MQClient {
 	mqc := MQClient{}
-	mqc.senders = make(map[string]*amqp.Sender)
 
 	connect(&mqc)
 
@@ -97,6 +100,12 @@ func New() MQClient {
 }
 
 func connect(mqc *MQClient) {
+
+	queueName := os.Getenv("INGRESS_QUEU_NAME")
+	if queueName == "" {
+		queueName = "event-hub"
+	}
+
 	// Create client
 	err := errors.New("Not connected")
 
@@ -105,18 +114,27 @@ func connect(mqc *MQClient) {
 			amqp.ConnSASLPlain(os.Getenv("ACTIVE_MQ_USERNAME"), os.Getenv("ACTIVE_MQ_PASSWORD")),
 		)
 		if err != nil {
-			log.Println("Could not connect to AMQP:", err, "Retrying in 5 seconds...")
+			log.Println("[!] Could not connect to AMQP:", err, "Retrying in 5 seconds...")
+			time.Sleep(5 * time.Second)
 		}
-		time.Sleep(5 * time.Second)
 	}
-
-	log.Println("[x] Connected to AMQP")
 
 	// Open a session
 	mqc.AMQPsession, err = mqc.AMQPclient.NewSession()
 	if err != nil {
 		log.Println("Creating AMQP session:", err)
 	}
+
+	// create a sender
+	mqc.sender, err = mqc.AMQPsession.NewSender(
+		amqp.LinkTargetAddress("/" + queueName),
+	)
+	if err != nil {
+		log.Println("Creating sender link:", err)
+		return
+	}
+
+	log.Println("[x] connected to AMQP")
 
 	mqc.ctx = context.Background()
 

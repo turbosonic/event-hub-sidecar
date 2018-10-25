@@ -17,7 +17,7 @@ func MQClient() mq.Client {
 	// 	log.Println("[x] Using Azure Service Bus as a message broker")
 	// 	return azureservicebus.New()
 	default:
-		log.Println("[x] Using ActiveMQ as a message broker")
+		log.Println("[x] using ActiveMQ as a message broker")
 		return activemq.New()
 	}
 }

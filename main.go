@@ -3,8 +3,6 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -16,14 +14,13 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/joho/godotenv"
-	"pack.ag/amqp"
 )
 
 var (
-	port string
+	port            string
 	eventReceiveURL string
-	retryCount int16
-	retryInterval int16
+	retryCount      int64
+	retryInterval   int64
 )
 
 func main() {
@@ -44,10 +41,10 @@ func main() {
 	// TODO: add an endpoint for sending events to the broker
 
 	// finally listen and serve the API
-	log.Fatal(http.ListenAndServe(":" + port, router))
+	log.Fatal(http.ListenAndServe(":"+port, router))
 }
 
-func getVariables(){
+func getVariables() {
 	// attempt to load environment variables from file
 	err := godotenv.Load()
 	if err != nil {
@@ -58,25 +55,25 @@ func getVariables(){
 
 	// is there a port are we using for the sidecar API? else default to 8989
 	port = os.Getenv("PORT")
-	if port = "" {
+	if port == "" {
 		port = "8989"
 	}
 	log.Print("[x] listening for http on localhost port " + port)
 
 	// is there a specific path to send events on? else default to locahost:8080/event
 	eventReceiveURL = os.Getenv("EVENT_RECEIEVE_URL")
-	if eventReceiveURL = "" {
+	if eventReceiveURL == "" {
 		eventReceiveURL = "http://localhost:8080/event"
 	}
 	log.Print("[x] received events will be posted to " + eventReceiveURL)
 
 	// how many times do we try to send the event? default to 3
 	retryCountStr := os.Getenv("EVENT_RECEIEVE_RETRY_COUNT")
-	retryCount, err := strconv.ParseInt(retryCountStr, 10, 16)
+	retryCount, err = strconv.ParseInt(retryCountStr, 10, 16)
 	if err != nil {
 		retryCount = 3
 	}
-	log.Print("[x] received events will attempted to sent " + strconv.Itoa(eventReceiveURL) + " time(s)"
+	log.Print("[x] received events will attempted to sent " + strconv.FormatInt(retryCount, 10) + " time(s)")
 
 	// how long do we wait to try again in seconds? default to 5
 	retryIntervalStr := os.Getenv("EVENT_RECEIEVE_RETRY_INTERVAL")
@@ -84,7 +81,7 @@ func getVariables(){
 	if err != nil {
 		retryInterval = 5
 	}
-	log.Print("[x] retries will be send after " + strconv.Itoa(retryInterval) + " second(s)"
+	log.Print("[x] retries will be send after " + strconv.FormatInt(retryInterval, 10) + " second(s)")
 }
 
 func handleEvent(event dto.Event) dto.HandledEventStatus {
@@ -92,37 +89,43 @@ func handleEvent(event dto.Event) dto.HandledEventStatus {
 	// marshal the event
 	payload, err := json.Marshal(&event)
 	if err != nil {
-		log.Printf("Could not marshal event: ", err)
+		log.Printf("[!] Could not marshal event: ", err)
 
 		// reject the event
 		return dto.Rejected
 	}
 
+	var resp *http.Response
+
 	// loop through the retries
-	for i := 0; i < retryCount; i++ {
-		resp, err := http.Post(eventReceiveURL, "application/json", bytes.NewBuffer(payload))
+	for i := int64(0); i < retryCount; i++ {
+		resp, err = http.Post(eventReceiveURL, "application/json", bytes.NewBuffer(payload))
 		if err != nil {
-			i = retryCount
+			time.Sleep(time.Duration(int64(time.Millisecond) * retryInterval))
 		} else {
-			time.Sleep(time.Second * retryInterval)
+			i = retryCount
 		}
 	}
 
 	// the service isn't available, release the event back into the queue
 	if err != nil {
+		log.Printf("[!] Could not send event to microservice: ", err)
 		return dto.Released
 	}
 
 	// the event caused the service to error, release the event back into the queue
 	if resp.StatusCode > 500 {
+		log.Printf("[!] Recieved a "+strconv.FormatInt(int64(resp.StatusCode), 10)+" from the service : ", err)
 		return dto.Released
 	}
-	
+
 	// the event is not valid, reject the event
 	if resp.StatusCode > 400 {
+		log.Printf("[!] Recieved a "+strconv.FormatInt(int64(resp.StatusCode), 10)+" from the service : ", err)
 		return dto.Rejected
 	}
 
 	// if we got here then we're all ok so tell the broker we've accepted the event
+	log.Printf("[x] Event recieved by service")
 	return dto.Accepted
 }
