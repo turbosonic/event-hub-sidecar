@@ -48,12 +48,18 @@ func main() {
 }
 
 func getVariables() {
+
 	// attempt to load environment variables from file
 	err := godotenv.Load()
 	if err != nil {
 		log.Print("[x] using system environment variables")
 	} else {
 		log.Print("[x] using .env environment variables")
+	}
+
+	// check we have a microservice name, else exit
+	if os.Getenv("MICROSERVICE_NAME") == "" {
+		log.Fatal("[!!!] No MICROSERVICE_NAME prodived, cannot continue, exiting...")
 	}
 
 	// is there a port are we using for the sidecar API? else default to 8989
