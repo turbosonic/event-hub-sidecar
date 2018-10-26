@@ -92,7 +92,7 @@ func handleEvent(event dto.Event) dto.HandledEventStatus {
 	// marshal the event
 	payload, err := json.Marshal(&event)
 	if err != nil {
-		log.Printf("[!] Could not marshal event: ", err)
+		log.Printf("[!] Could not marshal event: %+v", err)
 
 		// reject the event
 		return dto.Rejected
@@ -112,7 +112,7 @@ func handleEvent(event dto.Event) dto.HandledEventStatus {
 
 	// the service isn't available, release the event back into the queue
 	if err != nil {
-		log.Printf("[!] Could not send event to microservice: ", err)
+		log.Printf("[!] Could not send event to microservice: %+v", err)
 		return dto.Released
 	}
 
@@ -147,20 +147,20 @@ func sendEvent(w http.ResponseWriter, r *http.Request) {
 	err := json.NewDecoder(r.Body).Decode(&payload)
 
 	if err != nil {
-		log.Printf("[!] Could not decode event: ", err)
+		log.Printf("[!] Could not decode event: %+v", err)
 		w.WriteHeader(500)
 		return
 	}
 
 	// create the event to be sent
 	e := dto.Event{
-		"",
-		eventName,
-		os.Getenv("MICROSERVICE_NAME"),
-		time.Now(),
-		time.Now(),
-		payload,
-		requestID,
+		ID:        "",
+		Name:      eventName,
+		Source:    os.Getenv("MICROSERVICE_NAME"),
+		Timestamp: time.Now(),
+		Handled:   time.Now(),
+		Payload:   payload,
+		RequestID: requestID,
 	}
 
 	// loop through the retries trying to send it
@@ -175,7 +175,7 @@ func sendEvent(w http.ResponseWriter, r *http.Request) {
 
 	// if it errored then respond with a 500
 	if err != nil {
-		log.Printf("[!] Could not send event to microservice: ", err)
+		log.Printf("[!] Could not send event to microservice: %+v", err)
 		w.WriteHeader(500)
 		return
 	}
