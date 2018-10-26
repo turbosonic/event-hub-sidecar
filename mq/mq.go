@@ -1,6 +1,6 @@
 package mq
 
-import "event-delivery-sidecar/dto"
+import "github.com/turbosonic/event-hub-sidecar/dto"
 
 type MQ struct {
 	Client Client

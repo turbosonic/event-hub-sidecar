@@ -13,8 +13,8 @@ import (
 	MQTT "github.com/eclipse/paho.mqtt.golang"
 	"pack.ag/amqp"
 
-	"event-delivery-sidecar/dto"
-	"event-delivery-sidecar/mq"
+	"github.com/turbosonic/event-hub-sidecar/dto"
+	"github.com/turbosonic/event-hub-sidecar/mq"
 )
 
 type MQClient struct {

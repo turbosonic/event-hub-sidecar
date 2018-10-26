@@ -9,9 +9,9 @@ import (
 	"strconv"
 	"time"
 
-	"event-delivery-sidecar/dto"
-	"event-delivery-sidecar/factories"
-	"event-delivery-sidecar/mq"
+	"github.com/turbosonic/event-hub-sidecar/dto"
+	"github.com/turbosonic/event-hub-sidecar/factories"
+	"github.com/turbosonic/event-hub-sidecar/mq"
 
 	"github.com/gorilla/mux"
 	"github.com/joho/godotenv"
