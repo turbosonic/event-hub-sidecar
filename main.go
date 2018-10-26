@@ -153,15 +153,12 @@ func sendEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// create the event to be sent
-	e := dto.Event{
-		ID:        "",
-		Name:      eventName,
-		Source:    os.Getenv("MICROSERVICE_NAME"),
-		Timestamp: time.Now(),
-		Handled:   time.Now(),
-		Payload:   payload,
-		RequestID: requestID,
-	}
+	e := dto.Event{}
+	e.Name = eventName
+	e.Source = os.Getenv("MICROSERVICE_NAME")
+	e.Timestamp = time.Now()
+	e.Payload = payload
+	e.RequestID = requestID
 
 	// loop through the retries trying to send it
 	for i := int64(0); i < retryCount; i++ {
