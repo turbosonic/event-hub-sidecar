@@ -4,8 +4,8 @@ import (
 	"log"
 	"os"
 
-	"event-delivery-sidecar/mq"
-	"event-delivery-sidecar/mq/clients/activemq"
+	"github.com/turbosonic/event-hub-sidecar/mq"
+	"github.com/turbosonic/event-hub-sidecar/mq/clients/activemq"
 )
 
 // MQClient ...generates a concrete MQClient from environment variables
