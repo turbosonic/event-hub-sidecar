@@ -148,7 +148,7 @@ func sendEvent(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil {
 		log.Printf("[!] Could not decode event: %+v", err)
-		w.WriteHeader(500)
+		w.WriteHeader(400)
 		return
 	}
 
