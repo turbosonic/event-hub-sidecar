@@ -12,7 +12,7 @@ type EventFunction func(dto.Event) dto.HandledEventStatus
 type Client interface {
 
 	// handles the connections and reconnections to a message broker and the receiving of events
-	Listen(EventFunction)
+	Listen(EventFunction, chan bool)
 
 	// handles the sending of events
 	Send(*dto.Event) error

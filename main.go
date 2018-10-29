@@ -23,6 +23,7 @@ var (
 	retryCount      int64
 	retryInterval   int64
 	mqc             mq.Client
+	healthy         = false
 )
 
 func main() {
@@ -34,7 +35,16 @@ func main() {
 	mqc = factories.MQClient()
 
 	// ask the mq to listen for events, set this as a goroutine else we'll never move on
-	go mqc.Listen(handleEvent)
+	// pass in a bool channel to recieve indicators of connections
+	healthyChan := make(chan bool)
+	go mqc.Listen(handleEvent, healthyChan)
+
+	// wait for a message from the channel and update the variable
+	go func() {
+		for {
+			healthy = <-healthyChan
+		}
+	}()
 
 	// now we can move on to the inbound API
 	// create a new router
@@ -42,6 +52,9 @@ func main() {
 
 	// add an endpoint for sending events to the broker
 	router.HandleFunc("/events/{event_name}", sendEvent).Methods("POST")
+
+	// add a health endpoint
+	router.HandleFunc("/health", handleHeathRequest).Methods("GET")
 
 	// finally listen and serve the API
 	log.Fatal(http.ListenAndServe(":"+port, router))
@@ -61,20 +74,21 @@ func getVariables() {
 	if os.Getenv("MICROSERVICE_NAME") == "" {
 		log.Fatal("[!!!] No MICROSERVICE_NAME prodived, cannot continue, exiting...")
 	}
+	log.Print("Listening to topic and queue '" + os.Getenv("MICROSERVICE_NAME") + "'")
 
 	// is there a port are we using for the sidecar API? else default to 8989
 	port = os.Getenv("PORT")
 	if port == "" {
 		port = "8989"
 	}
-	log.Print("[x] events can be sent to  http://localhost:" + port + "/events/{event_name}")
+	log.Print("[x] events can be sent to http://localhost:" + port + "/events/{event_name}")
 
 	// is there a specific path to send events on? else default to locahost:8080/event
 	eventReceiveURL = os.Getenv("EVENT_RECEIEVE_URL")
 	if eventReceiveURL == "" {
-		eventReceiveURL = "http://localhost:8080/events"
+		eventReceiveURL = "http://localhost:8080/events/"
 	}
-	log.Print("[x] received events will be posted to " + eventReceiveURL)
+	log.Print("[x] received events will be posted to " + eventReceiveURL + "{event_name}")
 
 	// how many times do we try to send the event? default to 3
 	retryCountStr := os.Getenv("EVENT_RECEIEVE_RETRY_COUNT")
@@ -96,7 +110,7 @@ func getVariables() {
 func handleEvent(event dto.Event) dto.HandledEventStatus {
 
 	// marshal the event
-	payload, err := json.Marshal(&event)
+	payload, err := json.Marshal(&event.Payload)
 	if err != nil {
 		log.Printf("[!] Could not marshal event: %+v", err)
 
@@ -108,7 +122,7 @@ func handleEvent(event dto.Event) dto.HandledEventStatus {
 
 	// loop through the retries
 	for i := int64(0); i < retryCount; i++ {
-		resp, err = http.Post(eventReceiveURL, "application/json", bytes.NewBuffer(payload))
+		resp, err = http.Post(eventReceiveURL+event.Name, "application/json", bytes.NewBuffer(payload))
 		if err != nil {
 			time.Sleep(time.Duration(int64(time.Millisecond) * retryInterval))
 		} else {
@@ -185,4 +199,14 @@ func sendEvent(w http.ResponseWriter, r *http.Request) {
 
 	// if we made it here then the event was delivered, respond with a 201
 	w.WriteHeader(201)
+}
+
+func handleHeathRequest(w http.ResponseWriter, r *http.Request) {
+
+	// if healthy is false then return a 400, else 200
+	if !healthy {
+		w.WriteHeader(400)
+		return
+	}
+	w.WriteHeader(200)
 }

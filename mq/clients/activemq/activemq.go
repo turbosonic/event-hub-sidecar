@@ -25,7 +25,10 @@ type MQClient struct {
 	sender      *amqp.Sender
 }
 
-func (mqc MQClient) Listen(handleEvent mq.EventFunction) {
+func (mqc *MQClient) Listen(handleEvent mq.EventFunction, healthy chan bool) {
+
+	mqc.connect(healthy)
+
 	queueName := os.Getenv("MICROSERVICE_NAME")
 
 	// Create a receiver
@@ -43,7 +46,7 @@ func (mqc MQClient) Listen(handleEvent mq.EventFunction) {
 			msg, err := receiver.Receive(context.Background())
 			if err != nil {
 				log.Print("Reading message from AMQP:", err)
-				connect(&mqc)
+				mqc.connect(healthy)
 				break
 			}
 
@@ -76,7 +79,8 @@ func (mqc MQClient) Listen(handleEvent mq.EventFunction) {
 	})
 }
 
-func (mqc MQClient) Send(event *dto.Event) error {
+func (mqc *MQClient) Send(event *dto.Event) error {
+
 	// Send message
 	eventBytes, err := event.ToByteArray()
 	if err != nil {
@@ -91,15 +95,14 @@ func (mqc MQClient) Send(event *dto.Event) error {
 	return nil
 }
 
-func New() MQClient {
+func New() *MQClient {
 	mqc := MQClient{}
-
-	connect(&mqc)
-
-	return mqc
+	return &mqc
 }
 
-func connect(mqc *MQClient) {
+func (mqc *MQClient) connect(healthy chan bool) {
+
+	healthy <- false
 
 	queueName := os.Getenv("INGRESS_QUEU_NAME")
 	if queueName == "" {
@@ -122,7 +125,7 @@ func connect(mqc *MQClient) {
 	// Open a session
 	mqc.AMQPsession, err = mqc.AMQPclient.NewSession()
 	if err != nil {
-		log.Println("Creating AMQP session:", err)
+		log.Println("[!] Failed when creating AMQP session:", err)
 	}
 
 	// create a sender
@@ -130,11 +133,9 @@ func connect(mqc *MQClient) {
 		amqp.LinkTargetAddress("/" + queueName),
 	)
 	if err != nil {
-		log.Println("Creating sender link:", err)
+		log.Println("[!] Failed when creating AMQP sender link:", err)
 		return
 	}
-
-	log.Println("[x] connected to AMQP")
 
 	mqc.ctx = context.Background()
 
@@ -148,4 +149,8 @@ func connect(mqc *MQClient) {
 	if token := mqc.MQTTclient.Connect(); token.Wait() && token.Error() != nil {
 		panic(token.Error())
 	}
+
+	log.Println("[x] connected to MQTT")
+
+	healthy <- true
 }
