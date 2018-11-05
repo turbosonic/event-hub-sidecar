@@ -18,12 +18,14 @@ import (
 )
 
 var (
-	port            string
-	eventReceiveURL string
-	retryCount      int64
-	retryInterval   int64
-	mqc             mq.Client
-	healthy         = false
+	port                string
+	eventReceiveURL     string
+	retryCount          int64
+	retryInterval       int64
+	canaryEventInterval int64
+	canaryEnd           time.Time
+	mqc                 mq.Client
+	healthy             = false
 )
 
 func main() {
@@ -37,14 +39,31 @@ func main() {
 	// ask the mq to listen for events, set this as a goroutine else we'll never move on
 	// pass in a bool channel to recieve indicators of connections
 	healthyChan := make(chan bool)
-	go mqc.Listen(handleEvent, healthyChan)
+	eventChan := make(chan dto.Event)
 
-	// wait for a message from the channel and update the variable
+	// wait for a message from the channel and update the health variable
 	go func() {
 		for {
 			healthy = <-healthyChan
 		}
 	}()
+
+	go func() {
+		for {
+			go handleEvent(<-eventChan)
+
+			// some logic here to slow things down if required
+			time.Sleep(time.Duration(int64(time.Second) * canaryEventInterval))
+
+			// set the interval to zero if we're out of canary time
+			if canaryEventInterval > 0 && time.Now().After(canaryEnd) {
+				canaryEventInterval = 0
+				log.Print("[x] Canary period complete, processing at full speed")
+			}
+		}
+	}()
+
+	go mqc.Listen(eventChan, healthyChan)
 
 	// now we can move on to the inbound API
 	// create a new router
@@ -105,9 +124,29 @@ func getVariables() {
 		retryInterval = 5
 	}
 	log.Print("[x] retries will be sent after " + strconv.FormatInt(retryInterval, 10) + " second(s)")
+
+	// Canary mode how long do we wait between events in seconds? default to 0
+	canaryEventIntervalStr := os.Getenv("CANARY_EVENT_INTERVAL")
+	canaryEventInterval, err = strconv.ParseInt(canaryEventIntervalStr, 10, 16)
+	if err != nil {
+		canaryEventInterval = 0
+	} else {
+		log.Print("[x] CANARY MODE ACTIVE: events will be proccessed every " + strconv.FormatInt(canaryEventInterval, 10) + " second(s)")
+	}
+
+	// Canary mode how long does it last in seconds? default to 0
+	canaryPeriodStr := os.Getenv("CANARY_PERIOD")
+	canaryPeriod, err := strconv.ParseInt(canaryPeriodStr, 10, 16)
+	if err != nil {
+		canaryPeriod = 0
+	} else {
+		log.Print("[x] Canary mode will be active for " + strconv.FormatInt(canaryPeriod, 10) + " second(s)")
+	}
+
+	canaryEnd = time.Now().Add(time.Duration(int64(time.Second) * canaryPeriod))
 }
 
-func handleEvent(event dto.Event) dto.HandledEventStatus {
+func handleEvent(event dto.Event) {
 
 	// marshal the event
 	payload, err := json.Marshal(&event.Payload)
@@ -115,7 +154,14 @@ func handleEvent(event dto.Event) dto.HandledEventStatus {
 		log.Printf("[!] Could not marshal event: %+v", err)
 
 		// reject the event
-		return dto.Rejected
+		*event.HandledStatus <- dto.Rejected
+
+		if time.Now().Before(canaryEnd) {
+			log.Print("[!] Failed whilst in canary mode, exiting")
+			os.Exit(1)
+		}
+
+		return
 	}
 
 	var resp *http.Response
@@ -133,24 +179,45 @@ func handleEvent(event dto.Event) dto.HandledEventStatus {
 	// the service isn't available, release the event back into the queue
 	if err != nil {
 		log.Printf("[!] Could not send event to microservice: %+v", err)
-		return dto.Released
+		*event.HandledStatus <- dto.Released
+
+		if time.Now().Before(canaryEnd) {
+			log.Print("[!] Failed whilst in canary mode, exiting")
+			os.Exit(1)
+		}
+
+		return
 	}
 
 	// the event caused the service to error, release the event back into the queue
 	if resp.StatusCode > 500 {
 		log.Printf("[!] Recieved a "+strconv.FormatInt(int64(resp.StatusCode), 10)+" from the service : ", err)
-		return dto.Released
+		*event.HandledStatus <- dto.Released
+
+		if time.Now().Before(canaryEnd) {
+			log.Print("[!] Failed whilst in canary mode, exiting")
+			os.Exit(1)
+		}
+
+		return
 	}
 
 	// the event is not valid, reject the event
 	if resp.StatusCode > 400 {
 		log.Printf("[!] Recieved a "+strconv.FormatInt(int64(resp.StatusCode), 10)+" from the service : ", err)
-		return dto.Rejected
+		*event.HandledStatus <- dto.Rejected
+
+		if time.Now().Before(canaryEnd) {
+			log.Print("[!] Failed whilst in canary mode, exiting")
+			os.Exit(1)
+		}
+
+		return
 	}
 
 	// if we got here then we're all ok so tell the broker we've accepted the event
 	log.Printf("[x] Event recieved by service")
-	return dto.Accepted
+	*event.HandledStatus <- dto.Accepted
 }
 
 func sendEvent(w http.ResponseWriter, r *http.Request) {

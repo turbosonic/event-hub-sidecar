@@ -15,13 +15,14 @@ const (
 
 // Event ...an incomming event object
 type Event struct {
-	ID        string      `json:"id"`
-	Name      string      `json:"name"`
-	Source    string      `json:"source"`
-	Timestamp time.Time   `json:"timestamp"`
-	Handled   time.Time   `json:"handled_timestamp"`
-	Payload   interface{} `json:"payload"`
-	RequestID string      `json:"request_id"`
+	ID            string      `json:"id"`
+	Name          string      `json:"name"`
+	Source        string      `json:"source"`
+	Timestamp     time.Time   `json:"timestamp"`
+	Handled       time.Time   `json:"handled_timestamp"`
+	Payload       interface{} `json:"payload"`
+	RequestID     string      `json:"request_id"`
+	HandledStatus *chan HandledEventStatus
 }
 
 // NewEventFromByteArray .. creates an event from a ByteArray

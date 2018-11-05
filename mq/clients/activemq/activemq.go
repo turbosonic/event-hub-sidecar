@@ -14,7 +14,6 @@ import (
 	"pack.ag/amqp"
 
 	"github.com/turbosonic/event-hub-sidecar/dto"
-	"github.com/turbosonic/event-hub-sidecar/mq"
 )
 
 type MQClient struct {
@@ -25,9 +24,9 @@ type MQClient struct {
 	sender      *amqp.Sender
 }
 
-func (mqc *MQClient) Listen(handleEvent mq.EventFunction, healthy chan bool) {
+func (mqc *MQClient) Listen(eventChan chan dto.Event, healthyChan chan bool) {
 
-	mqc.connect(healthy)
+	mqc.connect(healthyChan)
 
 	queueName := os.Getenv("MICROSERVICE_NAME")
 
@@ -46,7 +45,7 @@ func (mqc *MQClient) Listen(handleEvent mq.EventFunction, healthy chan bool) {
 			msg, err := receiver.Receive(context.Background())
 			if err != nil {
 				log.Print("Reading message from AMQP:", err)
-				mqc.connect(healthy)
+				mqc.connect(healthyChan)
 				break
 			}
 
@@ -56,8 +55,12 @@ func (mqc *MQClient) Listen(handleEvent mq.EventFunction, healthy chan bool) {
 				msg.Release()
 			}
 
-			response := handleEvent(e)
-			switch response {
+			handledChan := make(chan dto.HandledEventStatus)
+			e.HandledStatus = &handledChan
+
+			eventChan <- e
+
+			switch <-handledChan {
 			case dto.Accepted:
 				msg.Accept()
 			case dto.Rejected:
@@ -75,7 +78,7 @@ func (mqc *MQClient) Listen(handleEvent mq.EventFunction, healthy chan bool) {
 			fmt.Printf("Could not unmarshal event: ", err)
 		}
 
-		handleEvent(e)
+		eventChan <- e
 	})
 }
 
