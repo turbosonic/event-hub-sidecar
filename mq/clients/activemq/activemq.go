@@ -28,6 +28,8 @@ func (mqc *MQClient) Listen(eventChan chan dto.Event, healthyChan chan bool) {
 
 	mqc.connect(healthyChan)
 
+	log.Println("[i] waiting for events...")
+
 	queueName := os.Getenv("MICROSERVICE_NAME")
 
 	// Create a receiver
@@ -51,7 +53,7 @@ func (mqc *MQClient) Listen(eventChan chan dto.Event, healthyChan chan bool) {
 
 			var e = dto.Event{}
 			if err := json.Unmarshal(msg.GetData(), &e); err != nil {
-				fmt.Printf("Could not unmarshal event: ", err)
+				log.Print("Could not unmarshal event: ", err)
 				msg.Release()
 			}
 
@@ -69,6 +71,8 @@ func (mqc *MQClient) Listen(eventChan chan dto.Event, healthyChan chan bool) {
 				msg.Release()
 			}
 
+			close(handledChan)
+
 		}
 	}()
 
@@ -78,7 +82,13 @@ func (mqc *MQClient) Listen(eventChan chan dto.Event, healthyChan chan bool) {
 			fmt.Printf("Could not unmarshal event: ", err)
 		}
 
+		handledChan := make(chan dto.HandledEventStatus)
+		e.HandledStatus = &handledChan
+
 		eventChan <- e
+
+		<-handledChan
+		close(handledChan)
 	})
 }
 
@@ -107,7 +117,7 @@ func (mqc *MQClient) connect(healthy chan bool) {
 
 	healthy <- false
 
-	queueName := os.Getenv("INGRESS_QUEU_NAME")
+	queueName := os.Getenv("INGRESS_QUEUE_NAME")
 	if queueName == "" {
 		queueName = "event-hub"
 	}
@@ -153,7 +163,7 @@ func (mqc *MQClient) connect(healthy chan bool) {
 		panic(token.Error())
 	}
 
-	log.Println("[x] connected to MQTT")
+	log.Println("[✓] connected to ActiveMQ via AMQP and MQTT")
 
 	healthy <- true
 }

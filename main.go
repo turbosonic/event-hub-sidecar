@@ -23,18 +23,23 @@ var (
 	retryCount          int64
 	retryInterval       int64
 	canaryEventInterval int64
+	eventConcurrency    int64
 	canaryEnd           time.Time
 	mqc                 mq.Client
 	healthy             = false
 )
 
 func main() {
+	// defer profile.Start(profile.MemProfile).Stop()
+
 	// set the default variables so we don't have to do it every time an event comes in
 	getVariables()
 
 	// Set up the connection to the MQ
 	// This provides an interface to the message broker
 	mqc = factories.MQClient()
+
+	log.Print("")
 
 	// ask the mq to listen for events, set this as a goroutine else we'll never move on
 	// pass in a bool channel to recieve indicators of connections
@@ -49,21 +54,29 @@ func main() {
 	}()
 
 	go func() {
+		// Create a semaphore channel which will fill up to the max concurrency (and thus pause processing events) and empty as the service responds
+		sem := make(chan bool, eventConcurrency)
+
 		for {
-			go handleEvent(<-eventChan)
 
-			// some logic here to slow things down if required
-			time.Sleep(time.Duration(int64(time.Second) * canaryEventInterval))
+			event := <-eventChan
+			sem <- true
 
-			// set the interval to zero if we're out of canary time
+			go handleEvent(event, sem)
+
+			// set the canary interval to zero if we're out of canary time
 			if canaryEventInterval > 0 && time.Now().After(canaryEnd) {
 				canaryEventInterval = 0
-				log.Print("[x] Canary period complete, processing at full speed")
+				log.Print("[i] Canary period complete, processing at full speed")
 			}
+
+			// some logic here to slow things down if required for canary
+			time.Sleep(time.Duration(int64(time.Second) * canaryEventInterval))
+
 		}
 	}()
 
-	go mqc.Listen(eventChan, healthyChan)
+	mqc.Listen(eventChan, healthyChan)
 
 	// now we can move on to the inbound API
 	// create a new router
@@ -84,30 +97,30 @@ func getVariables() {
 	// attempt to load environment variables from file
 	err := godotenv.Load()
 	if err != nil {
-		log.Print("[x] using system environment variables")
+		log.Print("[i] using system environment variables")
 	} else {
-		log.Print("[x] using .env environment variables")
+		log.Print("[i] using .env environment variables")
 	}
 
 	// check we have a microservice name, else exit
 	if os.Getenv("MICROSERVICE_NAME") == "" {
 		log.Fatal("[!!!] No MICROSERVICE_NAME prodived, cannot continue, exiting...")
 	}
-	log.Print("Listening to topic and queue '" + os.Getenv("MICROSERVICE_NAME") + "'")
+	log.Print("[i] listening to topic and queue '" + os.Getenv("MICROSERVICE_NAME") + "'")
 
 	// is there a port are we using for the sidecar API? else default to 8989
 	port = os.Getenv("PORT")
 	if port == "" {
 		port = "8989"
 	}
-	log.Print("[x] events can be sent to http://localhost:" + port + "/events/{event_name}")
+	log.Print("[i] events can be sent to http://localhost:" + port + "/events/{event_name}")
 
 	// is there a specific path to send events on? else default to locahost:8080/event
 	eventReceiveURL = os.Getenv("EVENT_RECEIEVE_URL")
 	if eventReceiveURL == "" {
 		eventReceiveURL = "http://localhost:8080/events/"
 	}
-	log.Print("[x] received events will be posted to " + eventReceiveURL + "{event_name}")
+	log.Print("[i] received events will be posted to " + eventReceiveURL + "{event_name}")
 
 	// how many times do we try to send the event? default to 3
 	retryCountStr := os.Getenv("EVENT_RECEIEVE_RETRY_COUNT")
@@ -115,7 +128,7 @@ func getVariables() {
 	if err != nil {
 		retryCount = 3
 	}
-	log.Print("[x] received events will attempted to be sent " + strconv.FormatInt(retryCount, 10) + " time(s)")
+	log.Print("[i] received events will attempted to be sent " + strconv.FormatInt(retryCount, 10) + " time(s)")
 
 	// how long do we wait to try again in seconds? default to 5
 	retryIntervalStr := os.Getenv("EVENT_RECEIEVE_RETRY_INTERVAL")
@@ -123,7 +136,15 @@ func getVariables() {
 	if err != nil {
 		retryInterval = 5
 	}
-	log.Print("[x] retries will be sent after " + strconv.FormatInt(retryInterval, 10) + " second(s)")
+	log.Print("[i] retries will be sent after " + strconv.FormatInt(retryInterval, 10) + " second(s)")
+
+	// how many events can be sent concurrently
+	eventConcurrencyStr := os.Getenv("EVENT_MAX_CONCURRENCY")
+	eventConcurrency, err = strconv.ParseInt(eventConcurrencyStr, 10, 16)
+	if err != nil {
+		eventConcurrency = 1
+	}
+	log.Print("[i] maximum events that can be sent concurrently is " + strconv.FormatInt(eventConcurrency, 10))
 
 	// Canary mode how long do we wait between events in seconds? default to 0
 	canaryEventIntervalStr := os.Getenv("CANARY_EVENT_INTERVAL")
@@ -131,7 +152,7 @@ func getVariables() {
 	if err != nil {
 		canaryEventInterval = 0
 	} else {
-		log.Print("[x] CANARY MODE ACTIVE: events will be proccessed every " + strconv.FormatInt(canaryEventInterval, 10) + " second(s)")
+		log.Print("[i] CANARY MODE ACTIVE: events will be proccessed every " + strconv.FormatInt(canaryEventInterval, 10) + " second(s)")
 	}
 
 	// Canary mode how long does it last in seconds? default to 0
@@ -139,14 +160,17 @@ func getVariables() {
 	canaryPeriod, err := strconv.ParseInt(canaryPeriodStr, 10, 16)
 	if err != nil {
 		canaryPeriod = 0
+		log.Print("[i] canary mode is not active")
 	} else {
-		log.Print("[x] Canary mode will be active for " + strconv.FormatInt(canaryPeriod, 10) + " second(s)")
+		log.Print("[i] canary mode will be active for " + strconv.FormatInt(canaryPeriod, 10) + " second(s)")
 	}
 
 	canaryEnd = time.Now().Add(time.Duration(int64(time.Second) * canaryPeriod))
 }
 
-func handleEvent(event dto.Event) {
+func handleEvent(event dto.Event, semaphore chan bool) {
+
+	defer func() { <-semaphore }()
 
 	// marshal the event
 	payload, err := json.Marshal(&event.Payload)
@@ -156,10 +180,7 @@ func handleEvent(event dto.Event) {
 		// reject the event
 		*event.HandledStatus <- dto.Rejected
 
-		if time.Now().Before(canaryEnd) {
-			log.Print("[!] Failed whilst in canary mode, exiting")
-			os.Exit(1)
-		}
+		checkCanary()
 
 		return
 	}
@@ -184,6 +205,8 @@ func handleEvent(event dto.Event) {
 		if time.Now().Before(canaryEnd) {
 			log.Print("[!] Failed whilst in canary mode, exiting")
 			os.Exit(1)
+		} else {
+			log.Print("[i] Failed to send event, retrying...")
 		}
 
 		return
@@ -194,10 +217,7 @@ func handleEvent(event dto.Event) {
 		log.Printf("[!] Recieved a "+strconv.FormatInt(int64(resp.StatusCode), 10)+" from the service : ", err)
 		*event.HandledStatus <- dto.Released
 
-		if time.Now().Before(canaryEnd) {
-			log.Print("[!] Failed whilst in canary mode, exiting")
-			os.Exit(1)
-		}
+		checkCanary()
 
 		return
 	}
@@ -207,16 +227,13 @@ func handleEvent(event dto.Event) {
 		log.Printf("[!] Recieved a "+strconv.FormatInt(int64(resp.StatusCode), 10)+" from the service : ", err)
 		*event.HandledStatus <- dto.Rejected
 
-		if time.Now().Before(canaryEnd) {
-			log.Print("[!] Failed whilst in canary mode, exiting")
-			os.Exit(1)
-		}
+		checkCanary()
 
 		return
 	}
 
 	// if we got here then we're all ok so tell the broker we've accepted the event
-	log.Printf("[x] Event recieved by service")
+	log.Printf("[✓] event recieved by service")
 	*event.HandledStatus <- dto.Accepted
 }
 
@@ -251,7 +268,8 @@ func sendEvent(w http.ResponseWriter, r *http.Request) {
 	for i := int64(0); i < retryCount; i++ {
 		err = mqc.Send(&e)
 		if err != nil {
-			time.Sleep(time.Duration(int64(time.Millisecond) * retryInterval))
+			log.Print("[!] event failed attempt ", i+1)
+			time.Sleep(time.Duration(int64(time.Second) * retryInterval))
 		} else {
 			i = retryCount
 		}
@@ -276,4 +294,11 @@ func handleHeathRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(200)
+}
+
+func checkCanary() {
+	if time.Now().Before(canaryEnd) {
+		log.Print("[!] Failed whilst in canary mode, exiting")
+		os.Exit(1)
+	}
 }
