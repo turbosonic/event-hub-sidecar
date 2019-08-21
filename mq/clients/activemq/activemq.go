@@ -8,13 +8,14 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync"
 	"time"
 
 	MQTT "github.com/eclipse/paho.mqtt.golang"
 	"pack.ag/amqp"
 
 	"github.com/turbosonic/event-hub-sidecar/dto"
-	"github.com/turbosonic/event-hub-sidecar/mq"
+	"github.com/turbosonic/event-hub-sidecar/variables"
 )
 
 type MQClient struct {
@@ -23,11 +24,42 @@ type MQClient struct {
 	AMQPsession *amqp.Session
 	MQTTclient  MQTT.Client
 	sender      *amqp.Sender
+	wg          sync.WaitGroup
+	terminating bool
+
+	queueChan   chan dto.Event
+	topicChan   chan dto.Event
+	healthyChan chan bool
 }
 
-func (mqc *MQClient) Listen(handleEvent mq.EventFunction, healthy chan bool) {
+func (mqc *MQClient) Terminate() error {
+	if !mqc.terminating {
 
-	mqc.connect(healthy)
+		mqc.healthyChan <- false
+		mqc.terminating = true
+
+		mqc.wg.Wait()
+
+		mqc.AMQPsession.Close(context.Background())
+		mqc.MQTTclient.Unsubscribe(os.Getenv("MICROSERVICE_NAME"))
+
+		close(mqc.queueChan)
+		close(mqc.topicChan)
+		close(mqc.healthyChan)
+	}
+
+	return nil
+}
+
+func (mqc *MQClient) Listen(queueChan chan dto.Event, topicChan chan dto.Event, healthyChan chan bool, vars *variables.Data) {
+
+	mqc.queueChan = queueChan
+	mqc.topicChan = topicChan
+	mqc.healthyChan = healthyChan
+
+	mqc.connect(mqc.healthyChan)
+
+	log.Println("[i] waiting for events...")
 
 	queueName := os.Getenv("MICROSERVICE_NAME")
 
@@ -40,42 +72,78 @@ func (mqc *MQClient) Listen(handleEvent mq.EventFunction, healthy chan bool) {
 		log.Fatal("Creating receiver link:", err)
 	}
 
+	// Create a semaphore channel which will fill up to the max concurrency (and thus pause processing queue events) and empty as the service responds
+	semaphore := make(chan bool, vars.EventConcurrency)
+
 	go func() {
 		for {
-			// Receive next message
-			msg, err := receiver.Receive(context.Background())
-			if err != nil {
-				log.Print("Reading message from AMQP:", err)
-				mqc.connect(healthy)
+			semaphore <- true
+
+			// break the loop if we're terminating
+			if mqc.terminating {
 				break
 			}
 
-			var e = dto.Event{}
-			if err := json.Unmarshal(msg.GetData(), &e); err != nil {
-				fmt.Printf("Could not unmarshal event: ", err)
-				msg.Release()
-			}
+			// Receive next message
+			msg, err := receiver.Receive(context.Background())
 
-			response := handleEvent(e)
-			switch response {
-			case dto.Accepted:
-				msg.Accept()
-			case dto.Rejected:
-				msg.Release()
-			default:
-				msg.Release()
+			if err != nil {
+				log.Print("[!] disconnected from AMQP: ", err)
+				if !mqc.terminating {
+					mqc.connect(mqc.healthyChan)
+				}
+				break
 			}
+			go func(sem chan bool, wg *sync.WaitGroup) {
+				defer func() {
+					wg.Done()
+					<-sem
+				}()
+
+				wg.Add(1)
+				var e = dto.Event{}
+				if err := json.Unmarshal(msg.GetData(), &e); err != nil {
+					log.Print("Could not unmarshal event: ", err)
+					msg.Release()
+				}
+
+				handledChan := make(chan dto.HandledEventStatus)
+				e.HandledStatus = &handledChan
+
+				mqc.queueChan <- e
+
+				switch <-handledChan {
+				case dto.Accepted:
+					msg.Accept()
+				case dto.Rejected:
+					msg.Release()
+				default:
+					msg.Release()
+				}
+
+				close(handledChan)
+
+			}(semaphore, &mqc.wg)
 
 		}
+		receiver.Close(context.Background())
 	}()
 
 	mqc.MQTTclient.Subscribe(os.Getenv("MICROSERVICE_NAME"), byte(0), func(client MQTT.Client, m MQTT.Message) {
+		mqc.wg.Add(1)
 		var e = dto.Event{}
 		if err := json.Unmarshal(m.Payload(), &e); err != nil {
 			fmt.Printf("Could not unmarshal event: ", err)
 		}
 
-		handleEvent(e)
+		handledChan := make(chan dto.HandledEventStatus)
+		e.HandledStatus = &handledChan
+
+		mqc.topicChan <- e
+
+		<-handledChan
+		close(handledChan)
+		mqc.wg.Done()
 	})
 }
 
@@ -97,6 +165,7 @@ func (mqc *MQClient) Send(event *dto.Event) error {
 
 func New() *MQClient {
 	mqc := MQClient{}
+	mqc.terminating = false
 	return &mqc
 }
 
@@ -104,7 +173,7 @@ func (mqc *MQClient) connect(healthy chan bool) {
 
 	healthy <- false
 
-	queueName := os.Getenv("INGRESS_QUEU_NAME")
+	queueName := os.Getenv("INGRESS_QUEUE_NAME")
 	if queueName == "" {
 		queueName = "event-hub"
 	}
@@ -150,7 +219,7 @@ func (mqc *MQClient) connect(healthy chan bool) {
 		panic(token.Error())
 	}
 
-	log.Println("[x] connected to MQTT")
+	log.Println("[✓] connected to ActiveMQ via AMQP and MQTT")
 
 	healthy <- true
 }

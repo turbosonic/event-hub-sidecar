@@ -1,50 +1,149 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"log"
 	"net/http"
 	"os"
-	"strconv"
+	"os/signal"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/turbosonic/event-hub-sidecar/dto"
 	"github.com/turbosonic/event-hub-sidecar/factories"
+	"github.com/turbosonic/event-hub-sidecar/logging"
 	"github.com/turbosonic/event-hub-sidecar/mq"
+	"github.com/turbosonic/event-hub-sidecar/outboundevents"
+	"github.com/turbosonic/event-hub-sidecar/variables"
 
 	"github.com/gorilla/mux"
-	"github.com/joho/godotenv"
 )
 
 var (
-	port            string
-	eventReceiveURL string
-	retryCount      int64
-	retryInterval   int64
-	mqc             mq.Client
-	healthy         = false
+	vars    variables.Data
+	mqc     mq.Client
+	lh      logging.Handler
+	server  http.Server
+	healthy = false
 )
 
 func main() {
+	// uncomment below for profiling
+	//defer profile.Start(profile.MemProfile).Stop()
+
 	// set the default variables so we don't have to do it every time an event comes in
-	getVariables()
+	vars = variables.GetVariables()
+
+	// first of all we need to handle signal interupts
+	// with Kubernetes scaling at will, it means that we could be asked to
+	// terminate at any time and if we're handing any events at that time
+	// we should wait for them to finish processing before exiting
+	var terminate sync.WaitGroup
+	terminate.Add(1)
+
+	go func() {
+		sigint := make(chan os.Signal, 1)
+
+		// interrupt signal sent from terminal
+		signal.Notify(sigint, os.Interrupt)
+		// sigterm signal sent from kubernetes
+		signal.Notify(sigint, syscall.SIGTERM)
+
+		<-sigint
+		log.Print("[i] kill signal received, waiting for outstanding events to be delivered...")
+
+		mqc.Terminate()
+
+		terminate.Done()
+	}()
 
 	// Set up the connection to the MQ
 	// This provides an interface to the message broker
 	mqc = factories.MQClient()
 
+	// Setup logging client
+	lc := factories.LogClient()
+	lh = logging.New(lc)
+
+	log.Print("")
+
 	// ask the mq to listen for events, set this as a goroutine else we'll never move on
 	// pass in a bool channel to recieve indicators of connections
 	healthyChan := make(chan bool)
-	go mqc.Listen(handleEvent, healthyChan)
+	queueChan := make(chan dto.Event)
+	topicChan := make(chan dto.Event)
+	errorChan := make(chan error)
 
-	// wait for a message from the channel and update the variable
+	// wait for a message from the channel and update the health variable
 	go func() {
 		for {
-			healthy = <-healthyChan
+			h, cont := <-healthyChan
+			if !cont {
+				break
+			}
+			healthy = h
 		}
 	}()
+
+	go func() {
+		for {
+			<-errorChan
+			if vars.CanaryEventInterval > 0 {
+				log.Print("[!] Error during canary period, closing up")
+				mqc.Terminate()
+				terminate.Done()
+			}
+		}
+	}()
+
+	// check for the end of the canary period
+	go func() {
+		if vars.CanaryEventInterval > 0 {
+			for {
+				if time.Now().After(vars.CanaryEnd) {
+					vars.CanaryEventInterval = 0
+					log.Print("[i] Canary period complete, processing at full speed")
+					break
+				}
+				time.Sleep(time.Second)
+			}
+		}
+	}()
+
+	// events via queues
+	go func() {
+		for {
+			// wait for the event
+			ev, cont := <-queueChan
+			if !cont {
+				break
+			}
+
+			// handle the event
+			go outboundevents.HandleEvent(&ev, &vars, errorChan, &lh)
+
+			// some logic here to slow things down if required for canary
+			time.Sleep(time.Duration(int64(time.Second) * vars.CanaryEventInterval))
+		}
+	}()
+
+	// events via topics
+	go func() {
+		for {
+			// wait for the event
+			ev, cont := <-topicChan
+			if !cont {
+				break
+			}
+
+			// nothing clever here, just process it
+			go outboundevents.HandleEvent(&ev, &vars, errorChan, &lh)
+		}
+
+	}()
+
+	mqc.Listen(queueChan, topicChan, healthyChan, &vars)
 
 	// now we can move on to the inbound API
 	// create a new router
@@ -56,101 +155,14 @@ func main() {
 	// add a health endpoint
 	router.HandleFunc("/health", handleHeathRequest).Methods("GET")
 
+	srv := &http.Server{Addr: ":" + vars.Port, Handler: router}
+
 	// finally listen and serve the API
-	log.Fatal(http.ListenAndServe(":"+port, router))
-}
+	go srv.ListenAndServe()
 
-func getVariables() {
-
-	// attempt to load environment variables from file
-	err := godotenv.Load()
-	if err != nil {
-		log.Print("[x] using system environment variables")
-	} else {
-		log.Print("[x] using .env environment variables")
-	}
-
-	// check we have a microservice name, else exit
-	if os.Getenv("MICROSERVICE_NAME") == "" {
-		log.Fatal("[!!!] No MICROSERVICE_NAME prodived, cannot continue, exiting...")
-	}
-	log.Print("Listening to topic and queue '" + os.Getenv("MICROSERVICE_NAME") + "'")
-
-	// is there a port are we using for the sidecar API? else default to 8989
-	port = os.Getenv("PORT")
-	if port == "" {
-		port = "8989"
-	}
-	log.Print("[x] events can be sent to http://localhost:" + port + "/events/{event_name}")
-
-	// is there a specific path to send events on? else default to locahost:8080/event
-	eventReceiveURL = os.Getenv("EVENT_RECEIEVE_URL")
-	if eventReceiveURL == "" {
-		eventReceiveURL = "http://localhost:8080/events/"
-	}
-	log.Print("[x] received events will be posted to " + eventReceiveURL + "{event_name}")
-
-	// how many times do we try to send the event? default to 3
-	retryCountStr := os.Getenv("EVENT_RECEIEVE_RETRY_COUNT")
-	retryCount, err = strconv.ParseInt(retryCountStr, 10, 16)
-	if err != nil {
-		retryCount = 3
-	}
-	log.Print("[x] received events will attempted to be sent " + strconv.FormatInt(retryCount, 10) + " time(s)")
-
-	// how long do we wait to try again in seconds? default to 5
-	retryIntervalStr := os.Getenv("EVENT_RECEIEVE_RETRY_INTERVAL")
-	retryInterval, err = strconv.ParseInt(retryIntervalStr, 10, 16)
-	if err != nil {
-		retryInterval = 5
-	}
-	log.Print("[x] retries will be sent after " + strconv.FormatInt(retryInterval, 10) + " second(s)")
-}
-
-func handleEvent(event dto.Event) dto.HandledEventStatus {
-
-	// marshal the event
-	payload, err := json.Marshal(&event.Payload)
-	if err != nil {
-		log.Printf("[!] Could not marshal event: %+v", err)
-
-		// reject the event
-		return dto.Rejected
-	}
-
-	var resp *http.Response
-
-	// loop through the retries
-	for i := int64(0); i < retryCount; i++ {
-		resp, err = http.Post(eventReceiveURL+event.Name, "application/json", bytes.NewBuffer(payload))
-		if err != nil {
-			time.Sleep(time.Duration(int64(time.Millisecond) * retryInterval))
-		} else {
-			i = retryCount
-		}
-	}
-
-	// the service isn't available, release the event back into the queue
-	if err != nil {
-		log.Printf("[!] Could not send event to microservice: %+v", err)
-		return dto.Released
-	}
-
-	// the event caused the service to error, release the event back into the queue
-	if resp.StatusCode > 500 {
-		log.Printf("[!] Recieved a "+strconv.FormatInt(int64(resp.StatusCode), 10)+" from the service : ", err)
-		return dto.Released
-	}
-
-	// the event is not valid, reject the event
-	if resp.StatusCode > 400 {
-		log.Printf("[!] Recieved a "+strconv.FormatInt(int64(resp.StatusCode), 10)+" from the service : ", err)
-		return dto.Rejected
-	}
-
-	// if we got here then we're all ok so tell the broker we've accepted the event
-	log.Printf("[x] Event recieved by service")
-	return dto.Accepted
+	// wait for a terminate signal and close the server
+	terminate.Wait()
+	srv.Close()
 }
 
 func sendEvent(w http.ResponseWriter, r *http.Request) {
@@ -175,30 +187,37 @@ func sendEvent(w http.ResponseWriter, r *http.Request) {
 	// create the event to be sent
 	e := dto.Event{}
 	e.Name = eventName
-	e.Source = os.Getenv("MICROSERVICE_NAME")
+	e.Source = vars.MicroserviceName
 	e.Timestamp = time.Now()
 	e.Payload = payload
 	e.RequestID = requestID
 
+	var attempts int64 = 0
+
 	// loop through the retries trying to send it
-	for i := int64(0); i < retryCount; i++ {
+	for i := int64(0); i < vars.RetryCount; i++ {
 		err = mqc.Send(&e)
 		if err != nil {
-			time.Sleep(time.Duration(int64(time.Millisecond) * retryInterval))
+			log.Print("[!] event failed attempt ", i+1)
+			time.Sleep(time.Duration(int64(time.Second) * vars.RetryInterval))
 		} else {
-			i = retryCount
+			i = vars.RetryCount
 		}
+		attempts++
 	}
 
 	// if it errored then respond with a 500
 	if err != nil {
 		log.Printf("[!] Could not send event to microservice: %+v", err)
 		w.WriteHeader(500)
+		lh.LogOutboundEvent(&e, dto.Failed, &vars, attempts)
 		return
 	}
 
 	// if we made it here then the event was delivered, respond with a 201
 	w.WriteHeader(201)
+
+	lh.LogOutboundEvent(&e, dto.Succeeded, &vars, attempts)
 }
 
 func handleHeathRequest(w http.ResponseWriter, r *http.Request) {
