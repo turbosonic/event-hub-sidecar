@@ -1,4 +1,4 @@
-package outboundevents
+package inboundevents
 
 import (
 	"bytes"
@@ -36,13 +36,20 @@ func HandleEvent(event *dto.Event, vars *variables.Data, errorChan chan error, l
 		return
 	}
 
+	client := &http.Client{}
+
+	req, _ := http.NewRequest("POST", vars.EventReceiveURL+event.Name, bytes.NewBuffer(payload))
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	req.Header.Set("x-request-id", event.RequestID)
+	req.Header.Set("x-source", event.Source)
+
 	var resp *http.Response
 
 	var attempts int64 = 0
 
 	// loop through the retries
 	for i := int64(0); i < vars.RetryCount; i++ {
-		resp, err = http.Post(vars.EventReceiveURL+event.Name, "application/json", bytes.NewBuffer(payload))
+		resp, err = client.Do(req)
 		if err != nil {
 			time.Sleep(time.Duration(int64(time.Millisecond) * vars.RetryInterval))
 		} else {

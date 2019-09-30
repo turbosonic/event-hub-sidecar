@@ -10,11 +10,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/turbosonic/event-hub-sidecar/dto"
+  "github.com/turbosonic/event-hub-sidecar/dto"
 	"github.com/turbosonic/event-hub-sidecar/factories"
+	"github.com/turbosonic/event-hub-sidecar/inboundevents"
 	"github.com/turbosonic/event-hub-sidecar/logging"
 	"github.com/turbosonic/event-hub-sidecar/mq"
-	"github.com/turbosonic/event-hub-sidecar/outboundevents"
 	"github.com/turbosonic/event-hub-sidecar/variables"
 
 	"github.com/gorilla/mux"
@@ -121,7 +121,7 @@ func main() {
 			}
 
 			// handle the event
-			go outboundevents.HandleEvent(&ev, &vars, errorChan, &lh)
+			go inboundevents.HandleEvent(&ev, &vars, errorChan, &lh)
 
 			// some logic here to slow things down if required for canary
 			time.Sleep(time.Duration(int64(time.Second) * vars.CanaryEventInterval))
@@ -138,7 +138,7 @@ func main() {
 			}
 
 			// nothing clever here, just process it
-			go outboundevents.HandleEvent(&ev, &vars, errorChan, &lh)
+			go inboundevents.HandleEvent(&ev, &vars, errorChan, &lh)
 		}
 
 	}()
