@@ -1,4 +1,6 @@
 /img/
 README.md
 .env
+.env.template
 bin
+Makefile

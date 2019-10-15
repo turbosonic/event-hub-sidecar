@@ -50,8 +50,8 @@ func HandleEvent(event *dto.Event, vars *variables.Data, errorChan chan error, l
 	// loop through the retries
 	for i := int64(0); i < vars.RetryCount; i++ {
 		resp, err = client.Do(req)
-		if err != nil {
-			time.Sleep(time.Duration(int64(time.Millisecond) * vars.RetryInterval))
+		if err != nil && i != vars.RetryCount-1 {
+			time.Sleep(time.Duration(int64(time.Second) * vars.RetryInterval))
 		} else {
 			i = vars.RetryCount
 		}

@@ -12,5 +12,4 @@ RUN apk --update add ca-certificates
 FROM scratch
 COPY --from=build-env /go/src/github.com/turbosonic/event-hub-sidecar/main.exe .
 COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-EXPOSE 8080
 ENTRYPOINT ["./main.exe"]
